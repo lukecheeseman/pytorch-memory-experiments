@@ -104,9 +104,12 @@ def actual(model, loss_fn, optimiser, train_loader):
 
     return mem_log
 
-# This function is trying to estimate memory used by the live allocations at peak allocation.
-# This assumes that
-def estimate(model, d_in, batchsize):
+# This function is trying to peak estimate memory used by the live allocations at peak allocation.
+# This assumes that memory usage isn't particularly optimsed
+#   - The intial cost of the model (weights, params, etc.), optimisers, ... is a consistent baseline
+#   - Input data and target, and outputs are deallocated after the training step
+#   - Intermdiates allocated during a forward are deallocated after the corresponding backward
+def estimate(model, loss_fn, optimiser, d_in, batchsize):
     with torch.no_grad():
         # Size of parameters (weights and biases - these show up as individual parameters for the
         # model but as groups for each module)
@@ -117,24 +120,39 @@ def estimate(model, d_in, batchsize):
         for param in model.parameters():
             model_size += np.prod(param.size()) * param.element_size()
 
-        # Account for the buffers
-        model_size *= 2
+        
+        # if SDG
+        # SDG optimiser doesn't use extra state
+        # Account for the gradient buffers
+        # model_size *=2
+
+        # if Adam
+        # Gradient buffers
+        # Adam keeps two extra buffers for momentum
+        model_size *= 4
 
         # Size of an input batch
         data = torch.randn(batchsize, d_in)
         model_size += np.prod(data.size()) * data.element_size()
 
+        # TODO: Size of the input target? is this a thing
+        # There seems to be some memory allocated beyond the input data
+        # before the first forward step but only happens with the train_loader
+        model_size += batchsize * 8
+
         # Account for size of intermediate outputs between layers on a forward
         # pass
         for module in model:
             data = module(data)
-            print(data)
             model_size += (np.prod(data.size()) * data.element_size())
 
-        # why is the output layer allocating slightly more memory than expected?
-        # e.g. the output layer is allocating an extra 64 bytes
+        # TODO: To figure out the general case
+        # Memory is allocated for the actual classification in the forward pass?
+        # e.g. batchsize many int64s
+        model_size += batchsize * 8
 
-        # The loss function and optimisers also allocating memory - how much
+        # Normalising, the loss function and optimisers also allocating memory - how much?
+        # when are they deallocated?
 
         return int(model_size)
 
@@ -145,13 +163,12 @@ def main():
     args = get_args()
     torch.cuda.set_device(args.local_rank)
 
+    #dist.init_process_group(backend=args.backend)
     torch.manual_seed(args.seed)
 
     model = nn.Sequential(*[ nn.Linear(d_in, d_hidden), nn.ReLU() ] +\
             [ layer for _ in range(args.layers) for layer in [nn.Linear(d_hidden, d_hidden), nn.ReLU()] ] +\
             [ nn.Linear(d_hidden, d_out) ])
-
-    expected = estimate(model, d_in, 32)
 
     transform = transforms.Compose(
         [
@@ -164,7 +181,9 @@ def main():
     train_loader = torch.utils.data.DataLoader(dataset, batch_size = 32)
 
     loss_fn = torch.nn.CrossEntropyLoss()
-    optimiser = optim.SGD(model.parameters(), lr=0.001)
+    optimiser = optim.Adam(model.parameters(), lr=0.001)
+
+    expected = estimate(model, loss_fn, optimiser, d_in, 32)
 
     nvml.nvmlInit()
     if torch.cuda.current_device() == 0:
